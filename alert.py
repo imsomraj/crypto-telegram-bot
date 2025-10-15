@@ -59,8 +59,14 @@ def main():
     dp.add_handler(CommandHandler("gnfi", gnfi_command))
 
     scheduler = BackgroundScheduler(timezone=pytz.timezone("Asia/Kolkata"))
-    scheduler.add_job(alert_prices, "interval", hours=2, args=[updater.job_queue])
-    scheduler.add_job(alert_gnfi, "interval", hours=6, args=[updater.job_queue])
+    scheduler.add_job(
+    alert_prices,
+    "interval",
+    hours=2,
+    timezone=pytz.timezone("Asia/Kolkata"),
+    args=[updater.job_queue]
+    )
+    scheduler.add_job(alert_gnfi, "interval", hours=6, timezone=pytz.timezone("Asia/Kolkata"), args=[updater.job_queue])
     scheduler.start()
 
     print("✅ Bot running on Choreo...")
