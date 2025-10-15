@@ -1,3 +1,4 @@
+import pytz
 import os
 import requests
 import datetime
@@ -57,7 +58,7 @@ def main():
     dp.add_handler(CommandHandler("price", price_command))
     dp.add_handler(CommandHandler("gnfi", gnfi_command))
 
-    scheduler = BackgroundScheduler()
+    scheduler = BackgroundScheduler(timezone=pytz.timezone("Asia/Kolkata"))
     scheduler.add_job(alert_prices, "interval", hours=2, args=[updater.job_queue])
     scheduler.add_job(alert_gnfi, "interval", hours=6, args=[updater.job_queue])
     scheduler.start()
