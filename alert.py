@@ -59,18 +59,20 @@ def ping():
 #     def secret_ping():
 #         return "OK", 200
 
+import os
+from wsgiref.simple_server import make_server
+
 def run_webserver():
-    """
-    Start a simple WSGI server on the port provided by the environment (Choreo sets PORT).
-    Runs in a daemon thread so it doesn't block the bot.
-    """
-    port = int(os.environ.get("PORT", "8080"))
+    # Choreo provides PORT env var — default to 8000 for local/testing
+    port = int(os.environ.get("PORT", "8000"))
+    host = "0.0.0.0"
     try:
-        server = make_server("0.0.0.0", port, app)
-        print(f"Webserver listening on 0.0.0.0:{port} (for /ping)")
+        server = make_server(host, port, app)
+        print(f"Webserver listening on {host}:{port} (for /ping)")
         server.serve_forever()
     except Exception as e:
         print("Webserver failed to start:", e)
+        
 # -----------------------------------------------------------------------------------------
 
 # ----------------- SAFETY / CHECKS ----------------
