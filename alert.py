@@ -18,6 +18,8 @@ import time
 import threading
 import requests
 import pytz
+from flask import Flask
+from wsgiref.simple_server import make_server
 from datetime import datetime, timezone, timedelta
 from math import isfinite
 from telegram import Bot
@@ -40,6 +42,36 @@ ALERT_COOLDOWN = int(os.getenv("ALERT_COOLDOWN", str(3600)))  # per-coin cooldow
 
 SETTINGS_FILE = "alert_settings.json"
 LOG_FILE = "crypto_log.txt"
+
+# ----- INSERT 2: paste this once after your global constants (e.g. after LOG_FILE) -----
+# simple Flask app for uptime pings (keeps Choreo alive when pinged)
+app = Flask(__name__)
+
+# public health route
+@app.route("/ping")
+def ping():
+    return "OK", 200
+
+# optional secret ping (recommended)
+# SECRET_PING = os.environ.get("SECRET_PING", "")
+# if SECRET_PING:
+#     @app.route(f"/ping/{SECRET_PING}")
+#     def secret_ping():
+#         return "OK", 200
+
+def run_webserver():
+    """
+    Start a simple WSGI server on the port provided by the environment (Choreo sets PORT).
+    Runs in a daemon thread so it doesn't block the bot.
+    """
+    port = int(os.environ.get("PORT", "8080"))
+    try:
+        server = make_server("0.0.0.0", port, app)
+        print(f"Webserver listening on 0.0.0.0:{port} (for /ping)")
+        server.serve_forever()
+    except Exception as e:
+        print("Webserver failed to start:", e)
+# -----------------------------------------------------------------------------------------
 
 # ----------------- SAFETY / CHECKS ----------------
 if not BOT_TOKEN or not CHAT_ID:
@@ -397,6 +429,11 @@ def main():
         print("Start send failed (may be OK if CHAT_ID invalid):", e)
     load_settings()
 
+    # ----- INSERT 3: place this just before updater.start_polling() inside main() -----
+    # start the small webserver thread so uptime monitors can ping /ping
+    web_thread = threading.Thread(target=run_webserver, daemon=True)
+    web_thread.start()
+    # ------------------------------------------------------------------------------------
     # start updater (handles commands)
     updater.start_polling()
 
