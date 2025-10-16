@@ -1,4 +1,5 @@
-python-telegram-bot==13.15
-apscheduler
+python-telegram-bot==13.11
 requests
 python-dotenv
+apscheduler
+pytz
