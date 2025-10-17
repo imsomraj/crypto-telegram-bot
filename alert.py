@@ -39,6 +39,12 @@ CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "300"))  # seconds between chec
 GNFI_CHECK_INTERVAL = int(os.getenv("GNFI_CHECK_INTERVAL", str(4 * 3600)))
 DAILY_SUMMARY_HOUR_IST = int(os.getenv("DAILY_SUMMARY_HOUR_IST", "21"))  # 21:00 IST
 ALERT_COOLDOWN = int(os.getenv("ALERT_COOLDOWN", str(3600)))  # per-coin cooldown in seconds
+# alert cooldown tracking
+last_alert_time = {c: 0 for c in COINS}
+
+# volume alert cooldown tracking (seconds)
+VOL_ALERT_COOLDOWN = int(os.getenv("VOL_ALERT_COOLDOWN", str(3600)))  # default 3600s = 1 hour
+last_volume_alert_time = {c: 0 for c in COINS}
 
 SETTINGS_FILE = "alert_settings.json"
 LOG_FILE = "crypto_log.txt"
@@ -371,14 +377,29 @@ def background_worker():
                         break  # skip checking the other timeframe this cycle
 
         # 4) Volume alert: compare recent 2h volume to baseline (using market_chart days=1)
+        # 4) Volume alert: compare recent 2h volume to baseline (using market_chart days=1)
         for coin in COINS:
             try:
                 vol_pct = compute_recent_volume_change_percent(coin, recent_hours=2, window_days=1)
-                if vol_pct is not None and abs(vol_pct) >= 20.0:  # threshold 20% by default
-                    send_message(f"⚡ <b>{coin.upper()}</b> volume changed {vol_pct:.2f}% in last 2h (approx).")
-                    write_log(f"VOLUME ALERT: {coin} vol change {vol_pct:.2f}%")
+                if vol_pct is None:
+                    continue
+
+                # only alert if absolute change crosses the percentage threshold (20% default)
+                if abs(vol_pct) >= 20.0:
+                    now_ts = timestamp  # current loop timestamp (already defined earlier)
+                    last_vol_ts = last_volume_alert_time.get(coin, 0)
+                    # cooldown check
+                    if (now_ts - last_vol_ts) >= VOL_ALERT_COOLDOWN:
+                        send_message(f"⚡ <b>{coin.upper()}</b> volume changed {vol_pct:.2f}% in last 2h (approx).")
+                        write_log(f"VOLUME ALERT: {coin} vol change {vol_pct:.2f}%")
+                        last_volume_alert_time[coin] = now_ts
+                    else:
+                        # optional: debug/log suppressed alert
+                        # print(f"Suppressed volume alert for {coin}. Cooldown active.")
+                        pass
             except Exception as e:
                 print("Volume check error:", e)
+                write_log(f"Volume check error for {coin}: {e}")
 
         # 5) GNFI periodic check and auto-alert (every GNFI_CHECK_INTERVAL)
         if now - last_gnfi_check >= GNFI_CHECK_INTERVAL:
