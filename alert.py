@@ -33,7 +33,7 @@ load_dotenv()  # optional local .env
 BOT_TOKEN = os.getenv("BOT_TOKEN")            # required (set in Choreo env)
 CHAT_ID = os.getenv("CHAT_ID")                # required
 COINS = ["bitcoin", "ethereum", "solana", "dogecoin"]
-PERCENT_THRESHOLD = float(os.getenv("PERCENT_THRESHOLD", "7"))  # default ±7%
+PERCENT_THRESHOLD = float(os.getenv("PERCENT_THRESHOLD", "4"))  # default ±4%
 TIMEFRAMES_HOURS = [1, 2]                     # check 1h & 2h
 CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "300"))  # seconds between checks
 GNFI_CHECK_INTERVAL = int(os.getenv("GNFI_CHECK_INTERVAL", str(4 * 3600)))
