@@ -2,7 +2,7 @@
 """
 crypto alert bot - full feature set:
 - Tracks BTC, ETH, SOL, DOGE
-- 1h & 2h % change alerts (default ±7%)
+- 1h & 2h % change alerts (default ±4%)
 - /price, /status, /alert, /gnfi, /help commands
 - GNFI (/gnfi) + auto alerts every 4 hours (thresholds <=25, >=75)
 - Daily summary (at 21:00 Asia/Kolkata)
@@ -35,7 +35,7 @@ CHAT_ID = os.getenv("CHAT_ID")                # required
 COINS = ["bitcoin", "ethereum", "solana", "dogecoin"]
 PERCENT_THRESHOLD = float(os.getenv("PERCENT_THRESHOLD", "4"))  # default ±4%
 TIMEFRAMES_HOURS = [1, 2]                     # check 1h & 2h
-CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "300"))  # seconds between checks
+CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "150"))  # seconds between checks
 GNFI_CHECK_INTERVAL = int(os.getenv("GNFI_CHECK_INTERVAL", str(4 * 3600)))
 DAILY_SUMMARY_HOUR_IST = int(os.getenv("DAILY_SUMMARY_HOUR_IST", "21"))  # 21:00 IST
 ALERT_COOLDOWN = int(os.getenv("ALERT_COOLDOWN", str(3600)))  # per-coin cooldown in seconds
@@ -158,42 +158,53 @@ def fetch_coin_market_chart_volumes(coin, days=1):
         write_log(f"Error fetch_coin_market_chart_volumes {coin}: {e}")
         return []
 
-def compute_recent_volume_change_percent(coin, recent_hours=2, window_days=1):
-    """Compute percent change: volume in last recent_hours vs avg hourly volume over previous window_days (rough).
-       Returns percent or None if not possible."""
-    vols = fetch_coin_market_chart_volumes(coin, days=window_days)
-    if not vols:
+def compute_recent_volume_change_percent(coin, recent_hours=2, window_days=1, min_samples=6):
+    """
+    Robustly compute percent change of volume in the most recent `recent_hours`
+    versus the baseline earlier in the last `window_days` days.
+
+    Returns percent (positive = increase, negative = decrease) or None if not enough data.
+    """
+    try:
+        vols = fetch_coin_market_chart_volumes(coin, days=window_days)
+        if not vols or len(vols) < min_samples:
+            return None
+
+        now_ms = int(time.time() * 1000)
+        recent_start = now_ms - recent_hours * 3600 * 1000
+
+        # Separate recent points and baseline points (only include baseline points before recent_start)
+        recent_points = [(ts, v) for ts, v in vols if ts >= recent_start]
+        baseline_points = [(ts, v) for ts, v in vols if ts < recent_start]
+
+        # Need enough samples on both sides
+        if len(recent_points) < 2 or len(baseline_points) < 2:
+            return None
+
+        # compute sums
+        recent_sum = sum(float(v) for ts, v in recent_points)
+        baseline_sum = sum(float(v) for ts, v in baseline_points)
+
+        # compute average per-point on baseline
+        baseline_avg_per_point = baseline_sum / len(baseline_points)
+
+        # expected baseline for the recent window scaled to the number of recent samples
+        expected_baseline = baseline_avg_per_point * len(recent_points)
+
+        # guard against division by zero
+        if expected_baseline == 0:
+            return None
+
+        percent = ((recent_sum - expected_baseline) / expected_baseline) * 100.0
+
+        # LOG helpful debug info for investigation
+        write_log(f"VOLUME DEBUG: {coin} recent_sum={recent_sum:.2f}, expected_baseline={expected_baseline:.2f}, "
+                  f"recent_count={len(recent_points)}, baseline_count={len(baseline_points)}, pct={percent:.2f}")
+
+        return percent
+    except Exception as e:
+        write_log(f"compute_recent_volume_change_percent ERROR for {coin}: {e}")
         return None
-    now_ms = int(time.time() * 1000)
-    recent_start = now_ms - recent_hours * 3600 * 1000
-    recent_sum = 0.0
-    prev_sum = 0.0
-    for ts_ms, vol in vols:
-        if ts_ms >= recent_start:
-            recent_sum += float(vol)
-        else:
-            prev_sum += float(vol)
-    # avoid dividing by zero; compute percent relative to prev_avg scaled to recent_hours
-    if prev_sum <= 0:
-        return None
-    # scale prev_sum proportionally: prev_sum covers approx (window_days*24 - recent_hours) hours -> convert to rate
-    # Simpler: percent = (recent_sum - (prev_sum * recent_hours / (len(vols)/24 * 24))) / baseline
-    # We'll compute baseline_avg_per_ms = prev_sum / (total_prev_ms)
-    # But we don't have exact spacing; approximate by ratio of counts:
-    prev_count = sum(1 for ts_ms, v in vols if ts_ms < recent_start)
-    if prev_count == 0:
-        return None
-    # compute average per-point
-    prev_avg = prev_sum / prev_count
-    # expected baseline for recent_hours points ~ prev_avg * (recent_count)
-    recent_count = sum(1 for ts_ms, v in vols if ts_ms >= recent_start)
-    if recent_count == 0:
-        return None
-    baseline = prev_avg * recent_count
-    if baseline <= 0:
-        return None
-    percent = ((recent_sum - baseline) / baseline) * 100.0
-    return percent
 
 def fetch_gnfi():
     try:
@@ -287,7 +298,7 @@ def status_command(update, context):
 def alert_command(update, context):
     global PERCENT_THRESHOLD
     if not context.args:
-        update.message.reply_text(f"Current threshold: ±{PERCENT_THRESHOLD}% (use /alert 7 to set)")
+        update.message.reply_text(f"Current threshold: ±{PERCENT_THRESHOLD}% (use /alert 4 to set)")
         return
     try:
         val = float(context.args[0])
