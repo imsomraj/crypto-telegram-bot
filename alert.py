@@ -49,28 +49,21 @@ last_volume_alert_time = {c: 0 for c in COINS}
 SETTINGS_FILE = "alert_settings.json"
 LOG_FILE = "crypto_log.txt"
 
-# ----- INSERT 2: paste this once after your global constants (e.g. after LOG_FILE) -----
-# simple Flask app for uptime pings (keeps Choreo alive when pinged)
+# ----- INSERT B: add flags and tiny Flask webserver -----
+# Flags to control noisy messages (set via environment variables)
+STARTUP_MSG_ENABLED = os.getenv("STARTUP_MSG_ENABLED", "false").lower() in ("1", "true", "yes")
+GNFI_SCHEDULED_ENABLED = os.getenv("GNFI_SCHEDULED_ENABLED", "false").lower() in ("1", "true", "yes")
+VOL_ALERT_ENABLED = os.getenv("VOL_ALERT_ENABLED", "false").lower() in ("1", "true", "yes")
+
+# simple Flask app for uptime / health checks
 app = Flask(__name__)
 
-# public health route
 @app.route("/ping")
 def ping():
     return "OK", 200
 
-# optional secret ping (recommended)
-# SECRET_PING = os.environ.get("SECRET_PING", "")
-# if SECRET_PING:
-#     @app.route(f"/ping/{SECRET_PING}")
-#     def secret_ping():
-#         return "OK", 200
-
-import os
-from wsgiref.simple_server import make_server
-
 def run_webserver():
-    # Choreo provides PORT env var — default to 8000 for local/testing
-    port = int(os.environ.get("PORT", "8000"))
+    port = int(os.environ.get("PORT", "8000"))  # use Choreo PORT or fallback to 8000
     host = "0.0.0.0"
     try:
         server = make_server(host, port, app)
@@ -78,8 +71,7 @@ def run_webserver():
         server.serve_forever()
     except Exception as e:
         print("Webserver failed to start:", e)
-        
-# -----------------------------------------------------------------------------------------
+# ----------------------------------------------------------------------
 
 # ----------------- SAFETY / CHECKS ----------------
 if not BOT_TOKEN or not CHAT_ID:
@@ -100,9 +92,6 @@ dispatcher = updater.dispatcher
 
 # price history: coin -> list of (epoch_seconds, price)
 price_history = {c: [] for c in COINS}
-
-# alert cooldown tracking
-last_alert_time = {c: 0 for c in COINS}
 
 # GNFI state tracking
 last_gnfi_state = None
@@ -388,7 +377,6 @@ def background_worker():
                         break  # skip checking the other timeframe this cycle
 
         # 4) Volume alert: compare recent 2h volume to baseline (using market_chart days=1)
-        # 4) Volume alert: compare recent 2h volume to baseline (using market_chart days=1)
         for coin in COINS:
             try:
                 vol_pct = compute_recent_volume_change_percent(coin, recent_hours=2, window_days=1)
@@ -397,17 +385,20 @@ def background_worker():
 
                 # only alert if absolute change crosses the percentage threshold (20% default)
                 if abs(vol_pct) >= 20.0:
-                    now_ts = timestamp  # current loop timestamp (already defined earlier)
-                    last_vol_ts = last_volume_alert_time.get(coin, 0)
-                    # cooldown check
-                    if (now_ts - last_vol_ts) >= VOL_ALERT_COOLDOWN:
-                        send_message(f"⚡ <b>{coin.upper()}</b> volume changed {vol_pct:.2f}% in last 2h (approx).")
-                        write_log(f"VOLUME ALERT: {coin} vol change {vol_pct:.2f}%")
-                        last_volume_alert_time[coin] = now_ts
+                    # cooldown logic & global enable flag
+                    if VOL_ALERT_ENABLED:
+                        now_ts = timestamp  # current loop timestamp (already defined earlier)
+                        last_vol_ts = last_volume_alert_time.get(coin, 0)
+                        if (now_ts - last_vol_ts) >= VOL_ALERT_COOLDOWN:
+                            send_message(f"⚡ <b>{coin.upper()}</b> volume changed {vol_pct:.2f}% in last 2h (approx).")
+                            write_log(f"VOLUME ALERT: {coin} vol change {vol_pct:.2f}%")
+                            last_volume_alert_time[coin] = now_ts
+                        else:
+                            # cooldown active — suppressed
+                            write_log(f"VOLUME ALERT suppressed for {coin} (cooldown). pct={vol_pct:.2f}")
                     else:
-                        # optional: debug/log suppressed alert
-                        # print(f"Suppressed volume alert for {coin}. Cooldown active.")
-                        pass
+                        # volume alerts globally disabled
+                        write_log(f"Volume alert detected for {coin}, but VOL_ALERT_ENABLED=false. pct={vol_pct:.2f}")
             except Exception as e:
                 print("Volume check error:", e)
                 write_log(f"Volume check error for {coin}: {e}")
@@ -458,9 +449,13 @@ def daily_summary_job():
 def main():
     # quick start message and setup
     try:
-        send_message("✅ Bot started and monitoring crypto prices...")
+        if STARTUP_MSG_ENABLED:
+            send_message("✅ Bot started and monitoring crypto prices...")
+        else:
+            write_log("Startup message suppressed (STARTUP_MSG_ENABLED=false).")
     except Exception as e:
-        print("Start send failed (may be OK if CHAT_ID invalid):", e)
+        print("Start send failed:", e)
+        write_log(f"Start send failed: {e}")
     load_settings()
 
     # ----- INSERT 3: place this just before updater.start_polling() inside main() -----
@@ -480,12 +475,21 @@ def main():
     # daily summary at DAILY_SUMMARY_HOUR_IST IST
     scheduler.add_job(daily_summary_job, "cron", hour=DAILY_SUMMARY_HOUR_IST, minute=0, timezone=pytz.timezone("Asia/Kolkata"))
     # GNFI regular check - we rely on background_worker for GNFI alerts, but we also keep a scheduled GNFI post if wanted:
-    scheduler.add_job(lambda: send_message("📊 GNFI check (manual scheduled)"), "interval", hours=GNFI_CHECK_INTERVAL/3600, timezone=pytz.timezone("Asia/Kolkata"))
+    # only add the scheduled GNFI manual message if enabled
+    if GNFI_SCHEDULED_ENABLED:
+        scheduler.add_job(
+            lambda: send_message("📊 GNFI check (manual scheduled)"),
+            "interval",
+            hours=GNFI_CHECK_INTERVAL/3600,
+            timezone=pytz.timezone("Asia/Kolkata")
+        )
+    else:
+        print("GNFI scheduled messages are disabled (GNFI_SCHEDULED_ENABLED=false)")
     scheduler.start()
 
     print("Bot running. Press Ctrl+C to stop.")
     write_log("Bot started.")
     updater.idle()
-
+# start the small webserver thread so uptime monitors can hit /ping
 if __name__ == "__main__":
     main()
