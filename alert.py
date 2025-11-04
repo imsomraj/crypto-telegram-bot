@@ -95,6 +95,10 @@ price_history = {c: [] for c in COINS}
 
 # GNFI state tracking
 last_gnfi_state = None
+# timestamp (epoch seconds) when GNFI auto-update/alert was last sent by scheduled job (05:45)
+last_gnfi_auto_sent = 0
+# cooldown (seconds) to suppress duplicate GNFI alerts if scheduled just ran (1 hour)
+GNFI_AUTO_ALERT_COOLDOWN = int(os.getenv("GNFI_AUTO_ALERT_COOLDOWN", str(3600)))
 last_gnfi_check = 0
 
 # settings persistence
@@ -299,18 +303,57 @@ def alert_command(update, context):
         update.message.reply_text("Usage: /alert 7")
 
 def gnfi_command(update, context):
+    """
+    Reply with current GNFI. If value is extreme and the morning job didn't
+    already send an alert recently, also send an immediate alert message.
+    This prevents duplicates: primary alert time is the 05:45 IST morning job.
+    """
+    global last_gnfi_auto_sent, last_gnfi_state
+
     obj = fetch_gnfi()
     if not obj:
         update.message.reply_text("⚠️ GNFI data unavailable right now.")
         return
+
+    # Format and reply the GNFI info to the user who called /gnfi
     dt = datetime.fromtimestamp(obj["timestamp"], timezone.utc).astimezone(pytz.timezone("Asia/Kolkata")).strftime("%Y-%m-%d %H:%M:%S %Z")
-    msg = (
+    value = obj["value"]
+    classification = obj["classification"]
+
+    reply_msg = (
         f"📊 <b>Greed & Fear Index</b>\n\n"
-        f"Value: {obj['value']} ({obj['classification']})\n"
+        f"Value: {value} ({classification})\n"
         f"Last updated: {dt}\n"
         f"Source: alternative.me"
     )
-    update.message.reply_text(msg, parse_mode="HTML")
+    update.message.reply_text(reply_msg, parse_mode="HTML")
+
+    # If GNFI is extreme, decide whether to send a bot-wide alert.
+    # We only send if the morning auto-job hasn't already sent an alert in the cooldown window.
+    try:
+        now_ts = int(time.time())
+
+        if value <= 25 or value >= 75:
+            # If morning job already sent an alert recently, suppress duplicate alert
+            if last_gnfi_auto_sent and (now_ts - last_gnfi_auto_sent) < GNFI_AUTO_ALERT_COOLDOWN:
+                write_log(f"/gnfi called but morning GNFI alert recently sent; suppressing duplicate alert. value={value}")
+                # Do not send a second bot-wide alert — user already got morning alert.
+                return
+
+            # Otherwise send an alert because user explicitly requested /gnfi
+            if value <= 25:
+                send_message(f"⚠️ ALERT: Market is in <b>Extreme Fear</b> ({value}) 😰 — manual /gnfi")
+                write_log(f"Manual /gnfi ALERT: Extreme Fear ({value})")
+                last_gnfi_state = "fear"
+                last_gnfi_auto_sent = now_ts
+            else:  # value >= 75
+                send_message(f"🚨 ALERT: Market is in <b>Extreme Greed</b> ({value}) 🤪 — manual /gnfi")
+                write_log(f"Manual /gnfi ALERT: Extreme Greed ({value})")
+                last_gnfi_state = "greed"
+                last_gnfi_auto_sent = now_ts
+
+    except Exception as e:
+        write_log(f"gnfi_command alert logic error: {e}")
 
 # Register command handlers
 dispatcher.add_handler(CommandHandler("help", help_command))
@@ -403,30 +446,6 @@ def background_worker():
                 print("Volume check error:", e)
                 write_log(f"Volume check error for {coin}: {e}")
 
-        # 5) GNFI periodic check and auto-alert (every GNFI_CHECK_INTERVAL)
-        if now - last_gnfi_check >= GNFI_CHECK_INTERVAL:
-            obj = fetch_gnfi()
-            last_gnfi_check = now
-            if obj:
-                val = obj["value"]
-                # determine state
-                state = None
-                if val <= 25:
-                    state = "fear"
-                elif val >= 75:
-                    state = "greed"
-                else:
-                    state = "normal"
-                # alert only on change to fear/greed
-                if state != "normal" and state != last_gnfi_state:
-                    if state == "fear":
-                        send_message(f"⚠️ ALERT: Market is in <b>Extreme Fear</b> ({val}) 😰\nClassification: {obj['classification']}")
-                        write_log(f"GNFI ALERT: Extreme Fear ({val})")
-                    elif state == "greed":
-                        send_message(f"🚨 ALERT: Market is in <b>Extreme Greed</b> ({val}) 🤪\nClassification: {obj['classification']}")
-                        write_log(f"GNFI ALERT: Extreme Greed ({val})")
-                last_gnfi_state = state
-
         # Sleep then loop
         time.sleep(CHECK_INTERVAL)
 
@@ -444,6 +463,46 @@ def daily_summary_job():
         lines.append(f"\n🧠 GNFI: {gnfi['value']} ({gnfi['classification']})")
     send_message("\n".join(lines))
     write_log("Daily summary sent.")
+
+def morning_gnfi_job():
+    """
+    Runs once per day at 05:45 IST.
+    Sends GNFI update and, if extreme, sends an alert.
+    """
+    global last_gnfi_auto_sent, last_gnfi_state
+    obj = fetch_gnfi()
+    if not obj:
+        write_log("Morning GNFI job: GNFI data unavailable.")
+        return
+
+    value = obj["value"]
+    classification = obj["classification"]
+    dt = datetime.fromtimestamp(obj["timestamp"], timezone.utc).astimezone(pytz.timezone("Asia/Kolkata")).strftime("%Y-%m-%d %H:%M:%S %Z")
+
+    # Informational morning update
+    msg = (
+        f"🌅 <b>Morning GNFI Update (IST)</b>\n\n"
+        f"Value: {value} ({classification})\n"
+        f"Last updated: {dt}\n"
+        f"Source: alternative.me"
+    )
+    send_message(msg)
+    write_log(f"Morning GNFI update sent: {value} ({classification})")
+
+    # Send alert only if extreme; record when we did so to suppress duplicates after manual /gnfi
+    now_ts = int(time.time())
+    if value <= 25:
+        send_message(f"⚠️ ALERT: Market is in <b>Extreme Fear</b> ({value}) 😰 — Morning check")
+        write_log(f"Morning GNFI ALERT: Extreme Fear ({value})")
+        last_gnfi_auto_sent = now_ts
+        last_gnfi_state = "fear"
+    elif value >= 75:
+        send_message(f"🚨 ALERT: Market is in <b>Extreme Greed</b> ({value}) 🤪 — Morning check")
+        write_log(f"Morning GNFI ALERT: Extreme Greed ({value})")
+        last_gnfi_auto_sent = now_ts
+        last_gnfi_state = "greed"
+    else:
+        last_gnfi_state = "normal"
 
 # ----------------- Start & run -----------------
 def main():
@@ -474,6 +533,8 @@ def main():
     scheduler = BackgroundScheduler(timezone=pytz.timezone("Asia/Kolkata"))
     # daily summary at DAILY_SUMMARY_HOUR_IST IST
     scheduler.add_job(daily_summary_job, "cron", hour=DAILY_SUMMARY_HOUR_IST, minute=0, timezone=pytz.timezone("Asia/Kolkata"))
+    # Morning GNFI job at 05:45 IST
+    scheduler.add_job(morning_gnfi_job, "cron", hour=5, minute=45, timezone=pytz.timezone("Asia/Kolkata"))
     # GNFI regular check - we rely on background_worker for GNFI alerts, but we also keep a scheduled GNFI post if wanted:
     # only add the scheduled GNFI manual message if enabled
     if GNFI_SCHEDULED_ENABLED:
