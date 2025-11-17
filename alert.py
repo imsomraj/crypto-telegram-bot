@@ -17,6 +17,8 @@ import json
 import time
 import threading
 import requests
+import statistics
+import json
 import pytz
 from flask import Flask
 from wsgiref.simple_server import make_server
@@ -198,6 +200,197 @@ def compute_recent_volume_change_percent(coin, recent_hours=2, window_days=1, mi
     except Exception as e:
         write_log(f"compute_recent_volume_change_percent ERROR for {coin}: {e}")
         return None
+
+# -------------------- Range Detector (Binance 1H) --------------------
+# Settings (matches your TradingView screenshot)
+RANGE_MIN_LEN = 25     # Minimum Range Length
+RANGE_WIDTH = 1.1      # Range Width multiplier (ATR * RANGE_WIDTH)
+ATR_LENGTH = 500       # ATR length
+VOL_CONFIRM_FACTOR = 0.9  # breakout candle volume must be >= avg_vol * this
+RANGE_SLACK = 5        # extra candles to fetch for safety
+
+# Which symbol(s) to check. Use Binance symbols.
+RANGE_SYMBOLS = ["BTCUSDT"]   # add others if you want
+
+RANGE_STATE_FILE = "range_state.json"
+
+def load_range_state():
+    try:
+        with open(RANGE_STATE_FILE, "r") as f:
+            return json.load(f)
+    except Exception:
+        # default structure per symbol
+        return {s: {"formed": False, "hh": None, "ll": None, "formed_at": 0, "breakout_at": 0} for s in RANGE_SYMBOLS}
+
+def save_range_state(state):
+    try:
+        with open(RANGE_STATE_FILE, "w") as f:
+            json.dump(state, f)
+    except Exception as e:
+        write_log(f"range_state save error: {e}")
+
+def get_binance_ohlc(symbol="BTCUSDT", interval="1h", limit=600):
+    """
+    Returns list of candles dicts (earliest->latest):
+    {time, open, high, low, close, volume}
+    """
+    url = "https://api.binance.com/api/v3/klines"
+    params = {"symbol": symbol, "interval": interval, "limit": limit}
+    r = requests.get(url, params=params, timeout=12)
+    r.raise_for_status()
+    data = r.json()
+    candles = []
+    for c in data:
+        candles.append({
+            "time": int(c[0]),
+            "open": float(c[1]),
+            "high": float(c[2]),
+            "low": float(c[3]),
+            "close": float(c[4]),
+            "volume": float(c[5]),
+        })
+    return candles
+
+def compute_atr_from_candles(candles, atr_len):
+    """
+    candles: list of candle dicts in chronological order (earliest->latest)
+    atr_len: number of TR values to average (needs atr_len+1 candles)
+    returns ATR (float) or None if not enough data
+    """
+    if len(candles) < atr_len + 1:
+        return None
+    trs = []
+    for i in range(1, len(candles)):
+        h = candles[i]["high"]
+        l = candles[i]["low"]
+        pc = candles[i-1]["close"]
+        tr = max(h - l, abs(h - pc), abs(l - pc))
+        trs.append(tr)
+    if len(trs) < atr_len:
+        return None
+    # use last atr_len TRs
+    recent_trs = trs[-atr_len:]
+    return statistics.mean(recent_trs)
+
+def detect_range_and_breakout_for_symbol(symbol):
+    """
+    Core logic:
+      - Fetch candles (ATR_LENGTH + RANGE_MIN_LEN + slack)
+      - Compute ATR
+      - Compute HH/LL over last RANGE_MIN_LEN closed candles (we use latest closed candles)
+      - If width <= ATR * RANGE_WIDTH => formation
+      - If formation exists, monitor closed candle close for breakout with volume confirmation
+    Returns a tuple (formation_msg_or_None, breakout_msg_or_None)
+    """
+    try:
+        limit = ATR_LENGTH + RANGE_MIN_LEN + RANGE_SLACK
+        candles = get_binance_ohlc(symbol=symbol, interval="1h", limit=limit)
+    except Exception as e:
+        write_log(f"Range detector: Binance fetch failed for {symbol}: {e}")
+        return None, None
+
+    # require enough candles
+    if len(candles) < ATR_LENGTH + RANGE_MIN_LEN:
+        write_log(f"Range detector: not enough candles for {symbol} (have {len(candles)})")
+        return None, None
+
+    # compute ATR using all returned candles
+    atr = compute_atr_from_candles(candles, ATR_LENGTH)
+    if atr is None or atr <= 0:
+        write_log(f"Range detector: ATR invalid for {symbol}")
+        return None, None
+
+    # consider the last RANGE_MIN_LEN closed candles (latest included)
+    recent_slice = candles[-RANGE_MIN_LEN:]
+    highs = [c["high"] for c in recent_slice]
+    lows = [c["low"] for c in recent_slice]
+    HH = max(highs)
+    LL = min(lows)
+    width = HH - LL
+
+    # average volume for recent window (used for breakout confirmation)
+    vol_samples = candles[-max(50, RANGE_MIN_LEN*2):]  # use a larger window for avg vol
+    avg_vol = statistics.mean([c["volume"] for c in vol_samples]) if vol_samples else 0.0
+
+    # last closed candle (the most recent closed 1h candle)
+    last_closed = candles[-1]
+    last_close = last_closed["close"]
+    last_vol = last_closed["volume"]
+
+    formation_msg = None
+    breakout_msg = None
+
+    # load persisted state
+    state = load_range_state()
+    s = state.get(symbol, {"formed": False, "hh": None, "ll": None, "formed_at": 0, "breakout_at": 0})
+
+    # check formation condition
+    if width <= atr * RANGE_WIDTH:
+        # formation detected
+        # if previously not formed or HH/LL changed meaningfully, set new formation
+        if (not s.get("formed")) or (abs(s.get("hh", 0) - HH) > 1e-8 or abs(s.get("ll", 0) - LL) > 1e-8):
+            s["formed"] = True
+            s["hh"] = HH
+            s["ll"] = LL
+            s["formed_at"] = int(time.time())
+            s["breakout_at"] = 0
+            formation_msg = (f"📦 <b>New Range Formed</b>\nSymbol: {symbol}\nHH: {HH:.2f}\nLL: {LL:.2f}\nWidth: {width:.2f}\nATR: {atr:.2f}")
+            write_log(f"Range formed for {symbol} HH={HH} LL={LL} width={width:.2f} atr={atr:.2f}")
+    else:
+        # if previously formed but now range condition broke, keep state as not formed so new formation can be detected later
+        if s.get("formed"):
+            s["formed"] = False
+            s["hh"] = None
+            s["ll"] = None
+            s["formed_at"] = 0
+            s["breakout_at"] = 0
+            write_log(f"Range cleared for {symbol} (width {width:.2f} > atr*{RANGE_WIDTH})")
+
+    # check breakout only if we have an active formation
+    if s.get("formed") and s.get("hh") is not None and s.get("ll") is not None:
+        HH_saved = s["hh"]
+        LL_saved = s["ll"]
+        # breakout up: last_close > HH_saved
+        if last_close > HH_saved and s.get("breakout_at", 0) == 0:
+            # volume confirmation
+            if avg_vol == 0 or last_vol >= avg_vol * VOL_CONFIRM_FACTOR:
+                breakout_msg = f"🚀 <b>Breakout UP</b>\nSymbol: {symbol}\nPrice: {last_close:.2f}\nRange HH: {HH_saved:.2f}"
+                s["breakout_at"] = int(time.time())
+                write_log(f"Breakout UP detected for {symbol} price={last_close} hh={HH_saved} vol={last_vol} avg={avg_vol:.2f}")
+            else:
+                write_log(f"Breakout UP suppressed for {symbol} due low vol {last_vol:.2f} avg {avg_vol:.2f}")
+        # breakout down: last_close < LL_saved
+        elif last_close < LL_saved and s.get("breakout_at", 0) == 0:
+            if avg_vol == 0 or last_vol >= avg_vol * VOL_CONFIRM_FACTOR:
+                breakout_msg = f"⚠️ <b>Breakout DOWN</b>\nSymbol: {symbol}\nPrice: {last_close:.2f}\nRange LL: {LL_saved:.2f}"
+                s["breakout_at"] = int(time.time())
+                write_log(f"Breakout DOWN detected for {symbol} price={last_close} ll={LL_saved} vol={last_vol} avg={avg_vol:.2f}")
+            else:
+                write_log(f"Breakout DOWN suppressed for {symbol} due low vol {last_vol:.2f} avg {avg_vol:.2f}")
+
+    # save state back
+    state[symbol] = s
+    save_range_state(state)
+
+    return formation_msg, breakout_msg
+
+def range_detector_job():
+    """
+    Scheduled job to check for range formation and breakout for each symbol.
+    Run this at minute=3 of each hour.
+    """
+    try:
+        for symbol in RANGE_SYMBOLS:
+            form_msg, break_msg = detect_range_and_breakout_for_symbol(symbol)
+            if form_msg:
+                # one formation alert per formation
+                send_message(form_msg)
+            if break_msg:
+                # one breakout alert per breakout
+                send_message(break_msg)
+    except Exception as e:
+        write_log(f"range_detector_job error: {e}")
+# --------------------------------------------------------------------
 
 def fetch_gnfi():
     try:
@@ -535,6 +728,8 @@ def main():
     scheduler.add_job(daily_summary_job, "cron", hour=DAILY_SUMMARY_HOUR_IST, minute=0, timezone=pytz.timezone("Asia/Kolkata"))
     # Morning GNFI job at 05:45 IST
     scheduler.add_job(morning_gnfi_job, "cron", hour=5, minute=45, timezone=pytz.timezone("Asia/Kolkata"))
+    # run detector at :03 each hour so the H:00 candle is closed
+    scheduler.add_job(range_detector_job, "cron", minute=3, timezone=pytz.timezone("Asia/Kolkata"))
     # GNFI regular check - we rely on background_worker for GNFI alerts, but we also keep a scheduled GNFI post if wanted:
     # only add the scheduled GNFI manual message if enabled
     if GNFI_SCHEDULED_ENABLED:
